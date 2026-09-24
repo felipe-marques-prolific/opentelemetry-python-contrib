@@ -375,6 +375,42 @@ class TestBaseManualFastAPI(TestBaseFastAPI):
         finally:
             self._instrumentor.uninstrument_app(app)
 
+    def test_included_router_nested_prefix_metric_target(self):
+        """
+        Regression test: http.target on the http.server.duration metric must
+        reflect every include_router(prefix=...) level, not just the
+        innermost route's own path template.
+        """
+        app = fastapi.FastAPI()
+        bar_router = fastapi.APIRouter()
+
+        @bar_router.put("/{bar_id}")
+        async def _update_bar(bar_id: str):
+            return {"id": bar_id}
+
+        foo_router = fastapi.APIRouter()
+        foo_router.include_router(bar_router, prefix="/bar")
+        app.include_router(foo_router, prefix="/api/foo")
+
+        self._instrumentor.instrument_app(app)
+        try:
+            client = TestClient(app)
+            resp = client.put("/api/foo/bar/abc123")
+            self.assertEqual(200, resp.status_code)
+
+            metrics = self.get_sorted_metrics(SCOPE)
+            duration_metrics = [
+                metric for metric in metrics if metric.name in ("http.server.duration", "http.server.request.duration")
+            ]
+            self.assertTrue(duration_metrics)
+            for metric in duration_metrics:
+                for point in metric.data.data_points:
+                    if isinstance(point, HistogramDataPoint):
+                        target = point.attributes.get("http.target") or point.attributes.get("url.path")
+                        self.assertEqual("/api/foo/bar/{bar_id}", target)
+        finally:
+            self._instrumentor.uninstrument_app(app)
+
     def test_custom_route_preserves_templated_path(self):
         class CustomPathRoute(BaseRoute):
             path = "/widgets/{widget_id}"
@@ -1200,7 +1236,7 @@ class TestAutoInstrumentation(TestBaseAutoFastAPI):
 
     @staticmethod
     def _instrumentation_failed_to_load_call(dependency_conflict):
-        return call("Skipping instrumentation %s: %s", "fastapi", dependency_conflict)
+        return call(dependency_conflict._format_message("fastapi"))
 
     @patch("opentelemetry.instrumentation.auto_instrumentation._load._logger")
     def test_instruments_with_fastapi_installed(self, mock_logger):
@@ -1220,7 +1256,7 @@ class TestAutoInstrumentation(TestBaseAutoFastAPI):
         mock_dep.return_value = dependency_conflict
         _load_instrumentors(mock_distro)
         mock_distro.load_instrumentor.assert_not_called()
-        mock_logger.debug.assert_has_calls([self._instrumentation_failed_to_load_call(dependency_conflict)])
+        mock_logger.error.assert_has_calls([self._instrumentation_failed_to_load_call(dependency_conflict)])
 
     @patch("opentelemetry.instrumentation.auto_instrumentation._load.get_dist_dependency_conflicts")
     @patch("opentelemetry.instrumentation.auto_instrumentation._load._logger")
